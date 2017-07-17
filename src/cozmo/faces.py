@@ -1,4 +1,4 @@
-# Copyright (c) 2016 Anki, Inc.
+# Copyright (c) 2016-2017 Anki, Inc.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -35,22 +35,20 @@ __all__ = ['FACE_VISIBILITY_TIMEOUT',
            'FACIAL_EXPRESSION_SURPRISED', 'FACIAL_EXPRESSION_ANGRY', 'FACIAL_EXPRESSION_SAD',
            'EvtErasedEnrolledFace', 'EvtFaceAppeared', 'EvtFaceDisappeared',
            'EvtFaceIdChanged', 'EvtFaceObserved', 'EvtFaceRenamed',
-           'EnrollNamedFace', 'Face',
+           'Face',
            'erase_all_enrolled_faces', 'erase_enrolled_face_by_id',
            'update_enrolled_face_by_id']
 
 
-import math
-import time
 
 from . import logger
 
-from . import action
+from . import behavior
 from . import event
 from . import objects
 from . import util
 
-from ._clad import _clad_to_engine_iface, _clad_to_engine_cozmo
+from ._clad import _clad_to_engine_iface
 from ._clad import _clad_to_game_anki
 
 
@@ -173,30 +171,6 @@ def update_enrolled_face_by_id(conn, face_id, old_name, new_name):
     conn.send_msg(msg)
 
 
-class EnrollNamedFace(action.Action):
-    '''Represents the enroll named face action in progress.
-
-    Returned by :meth:`cozmo.faces.Face.name_face`
-    '''
-
-    _action_type = _clad_to_engine_cozmo.RobotActionType.ENROLL_NAMED_FACE
-
-    def __init__(self, face, name, **kw):
-        super().__init__(**kw)
-        #: The face (e.g. an instance of :class:`cozmo.faces.Face`) that will be named.
-        self.face = face
-        #: The name that is going to be bound to the face.
-        self.name = name
-
-    def _repr_values(self):
-        return "face=%s name=%s" % (self.face, self.name)
-
-    def _encode(self):
-        return _clad_to_engine_iface.EnrollNamedFace(faceID=self.face.face_id,
-                                                     name=self.name,
-                                                     sequence=_clad_to_engine_cozmo.FaceEnrollmentSequence.Simple)
-
-
 def _clad_facial_expression_to_facial_expression(clad_expression_type):
     if clad_expression_type == _clad_to_game_anki.Vision.FacialExpression.Unknown:
         return FACIAL_EXPRESSION_UNKNOWN
@@ -231,10 +205,6 @@ class Face(objects.ObservableElement):
     #: Length of time in seconds to go without receiving an observed event before
     #: assuming that Cozmo can no longer see a face.
     visibility_timeout = FACE_VISIBILITY_TIMEOUT
-
-    #: callable: The factory function to return an :class:`EnrollNamedFace`
-    #: class or subclass instance.
-    enroll_named_face_factory = EnrollNamedFace
 
     def __init__(self, conn, world, robot, face_id=None, **kw):
         super().__init__(conn, world, robot, **kw)
@@ -306,12 +276,12 @@ class Face(objects.ObservableElement):
     def expression(self):
         '''string: The facial expression Cozmo has recognized on the face.
 
-        Will be ``FACIAL_EXPRESSION_UNKNOWN`` by default if you haven't called
+        Will be :attr:`FACIAL_EXPRESSION_UNKNOWN` by default if you haven't called
         :meth:`cozmo.robot.Robot.enable_facial_expression_estimation` to enable
         the facial expression estimation. Otherwise it will be equal to one of:
-        ``FACIAL_EXPRESSION_NEUTRAL``, ``FACIAL_EXPRESSION_HAPPY``,
-        ``FACIAL_EXPRESSION_SURPRISED``, ``FACIAL_EXPRESSION_ANGRY``,
-        or ``FACIAL_EXPRESSION_SAD``.
+        :attr:`FACIAL_EXPRESSION_NEUTRAL`, :attr:`FACIAL_EXPRESSION_HAPPY`,
+        :attr:`FACIAL_EXPRESSION_SURPRISED`, :attr:`FACIAL_EXPRESSION_ANGRY`,
+        or :attr:`FACIAL_EXPRESSION_SAD`.
         '''
         return self._expression
 
@@ -387,26 +357,57 @@ class Face(objects.ObservableElement):
 
     #### Commands ####
 
+    def _is_valid_name(self, name):
+        if not (name and name.isalpha()):
+            return False
+        try:
+            name.encode('ascii')
+        except UnicodeEncodeError:
+            return False
+
+        return True
+
     def name_face(self, name):
         '''Assign a name to this face. Cozmo will remember this name between SDK runs.
 
         Args:
-            name (string): The name that will be assigned to this face
+            name (string): The name that will be assigned to this face. Must
+                be a non-empty ASCII string of alphabetic characters only.
         Returns:
-            An instance of :class:`cozmo.faces.EnrollNamedFace` action object
+            An instance of :class:`cozmo.behavior.Behavior` object
+        Raises:
+            :class:`ValueError` if name is invalid.
         '''
-        logger.info("Sending enroll named face request for face=%s and name=%s", self, name)
-        action = self.enroll_named_face_factory(face=self, name=name, conn=self.conn,
-                                                robot=self._robot, dispatch_parent=self)
-        self._robot._action_dispatcher._send_single_action(action)
-        return action
+        if not self._is_valid_name(name):
+            raise ValueError("new_name '%s' is an invalid face name. "
+                             "Must be non-empty and contain only alphabetic ASCII characters." % name)
+
+        logger.info("Enrolling face=%s with name='%s'", self, name)
+
+        # Note: saveID must be 0 if face_id doesn't already have a name
+        msg = _clad_to_engine_iface.SetFaceToEnroll(name=name,
+                                                    observedID=self.face_id,
+                                                    saveID=0,
+                                                    saveToRobot=True,
+                                                    sayName=False,
+                                                    useMusic=False)
+        self.conn.send_msg(msg)
+
+        enroll_behavior = self._robot.start_behavior(behavior.BehaviorTypes._EnrollFace)
+        return enroll_behavior
 
     def rename_face(self, new_name):
         '''Change the name assigned to the face. Cozmo will remember this name between SDK runs.
 
         Args:
-            new_name (string): The new name for the face
+            new_name (string): The new name that will be assigned to this face. Must
+                be a non-empty ASCII string of alphabetic characters only.
+        Raises:
+            :class:`ValueError` if new_name is invalid.
         '''
+        if not self._is_valid_name(new_name):
+            raise ValueError("new_name '%s' is an invalid face name. "
+                             "Must be non-empty and contain only alphabetic ASCII characters." % new_name)
         update_enrolled_face_by_id(self.conn, self.face_id, self.name, new_name)
 
     def erase_enrolled_face(self):

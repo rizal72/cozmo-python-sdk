@@ -1,4 +1,4 @@
-# Copyright (c) 2016 Anki, Inc.
+# Copyright (c) 2016-2017 Anki, Inc.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -73,7 +73,6 @@ class EvtConnectionClosed(event.Event):
 # Some messages have no robotID but should still be forwarded to the primary robot
 FORCED_ROBOT_MESSAGES = {"AnimationAborted",
                          "AnimationEvent",
-                         "AvailableObjects",
                          "BehaviorObjectiveAchieved",
                          "BehaviorTransition",
                          "BlockPickedUp",
@@ -81,8 +80,13 @@ FORCED_ROBOT_MESSAGES = {"AnimationAborted",
                          "BlockPoolDataMessage",
                          "CarryStateUpdate",
                          "ChargerEvent",
+                         "ConnectedObjectStates",
                          "CubeLightsStateTransition",
+                         "CurrentCameraParams",
                          "LoadedKnownFace",
+                         "LocatedObjectStates",
+                         "ObjectConnectionState",
+                         "ObjectPowerLevel",
                          "ObjectProjectsIntoFOV",
                          "ReactionaryBehaviorTransition",
                          "RobotChangedObservedFaceID",
@@ -334,31 +338,52 @@ class CozmoConnection(event.Dispatcher, clad_protocol.CLADProtocol):
             except AttributeError:
                 pass
 
+            line_separator = "=" * 80
+            error_message = "\n" + line_separator + "\n"
+
             if not build_versions_match:
-                logger.warning('Build versions do not match (cozmoclad version %s != app version %s) - connection refused',
-                                cozmoclad.__build_version__, msg.buildVersion)
+
+                def _trimmed_version(ver_string):
+                    # Trim leading zeros from the version string.
+                    trimmed_string = ""
+                    for i in ver_string.split("."):
+                        trimmed_string += str(int(i)) + "."
+                    return trimmed_string[:-1]  # remove trailing "."
+
+                error_message += ("App and SDK versions do not match!\n"
+                                  "----------------------------------\n"
+                                  "SDK's cozmoclad version: %s\n"
+                                  "         != app version: %s\n\n"
+                                  % (cozmoclad.__version__, _trimmed_version(msg.buildVersion)))
 
                 if cozmoclad.__build_version__ < msg.buildVersion:
                     # App is newer
-                    logger.error(
-                        'Please update your SDK to the newest version by calling command: '
-                        '"pip3 install --user --upgrade cozmo" '
-                        'and downloading the latest examples from http://cozmosdk.anki.com/docs/downloads.html')
+                    error_message += ('Please update your SDK to the newest version by calling command:\n'
+                                      '"pip3 install --user --upgrade cozmo"\n'
+                                      'and downloading the latest examples from:\n'
+                                      'http://cozmosdk.anki.com/docs/downloads.html\n')
                 else:
                     # SDK is newer
-                    logger.error("Please update your app to the most recent version on the app store.")
-                    logger.error("Or, if you prefer, please determine which SDK version matches your app version at:")
-                    logger.error("http://go.anki.com/cozmo-sdk-version")
-                    logger.error("Then downgrade your SDK by calling the following command, replacing")
-                    logger.error("SDK_VERSION with the version listed at that page:")
-                    logger.error("'pip3 install --ignore-installed cozmo==SDK_VERSION'")
+                    error_message += ('Please either:\n\n'
+                                      '1) Update your app to the most recent version on the app store.\n'
+                                      '2) Or, if you prefer, please determine which SDK version matches\n'
+                                      '   your app version at: http://go.anki.com/cozmo-sdk-version\n'
+                                      '   Then downgrade your SDK by calling the following command,\n'
+                                      '   replacing SDK_VERSION with the version listed at that page:\n'
+                                      '   "pip3 install --ignore-installed cozmo==SDK_VERSION"\n')
 
             else:
                 # CLAD version mismatch
-                logger.error('Your Python and C++ CLAD versions do not match - connection refused.')
-                logger.error('Please check that you have the most recent versions of both the SDK and the Cozmo app.')
-                logger.error("You may update your SDK by calling: 'pip3 install --user --ignore-installed cozmo'.")
-                logger.error("Please also check the app store for a Cozmo app update.")
+                error_message += ('CLAD Hashes do not match!\n'
+                                  '-------------------------\n'
+                                  'Your Python and C++ CLAD versions do not match - connection refused.\n'
+                                  'Please check that you have the most recent versions of both the SDK and the\n'
+                                  'Cozmo app. You may update your SDK by calling:\n'
+                                  '"pip3 install --user --ignore-installed cozmo".\n'
+                                  'Please also check the app store for a Cozmo app update.\n')
+
+            error_message += line_separator
+            logger.error(error_message)
 
             exc = exceptions.SDKVersionMismatch("SDK library does not match software running on device")
             self.abort(exc)
@@ -371,18 +396,29 @@ class CozmoConnection(event.Dispatcher, clad_protocol.CLADProtocol):
                 'cozmoclad_version=%s app_build_version=%s',
                 version.__version__, cozmoclad.__version__, msg.buildVersion)
 
-        # We send RequestAvailableObjects before refreshing the animation names
-        # as this ensures that we will receive the responses before we mark the
-        # robot as ready
-        msg = _clad_to_engine_iface.RequestAvailableObjects()
-        self.send_msg(msg)
+        # We send RequestConnectedObjects and RequestLocatedObjectStates before
+        # refreshing the animation names as this ensures that we will receive
+        # the responses before we mark the robot as ready.
+        self._request_connected_objects()
+        self._request_located_objects()
 
         self.anim_names.refresh()
+
+    def _request_connected_objects(self):
+        # Request information on connected objects (e.g. the object ID of each cube)
+        # (this won't provide location/pose info)
+        msg = _clad_to_engine_iface.RequestConnectedObjects()
+        self.send_msg(msg)
+
+    def _request_located_objects(self):
+        # Request the pose information for all objects whose location we know
+        # (this won't include any objects where the location is currently not known)
+        msg = _clad_to_engine_iface.RequestLocatedObjectStates()
+        self.send_msg(msg)
 
     def _recv_msg_image_chunk(self, evt, *, msg):
         if self._primary_robot:
             self._primary_robot.dispatch_event(evt)
-
 
     #### Public Event Handlers ####
 

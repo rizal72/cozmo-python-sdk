@@ -1,4 +1,4 @@
-# Copyright (c) 2016 Anki, Inc.
+# Copyright (c) 2016-2017 Anki, Inc.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -25,7 +25,7 @@ __all__ = ['Angle', 'degrees', 'radians',
            'Rotation', 'rotation_quaternion', 'rotation_z_angle',
            'angle_z_to_quaternion',
            'Speed', 'speed_mmps',
-           'Timeout']
+           'Timeout', 'Vector2', 'Vector3']
 
 
 import collections
@@ -297,18 +297,26 @@ class Pose:
     Only poses of the same origin_id can safely be compared or operated on
     '''
 
-    __slots__ = ('_position', '_rotation', '_origin_id')
+    __slots__ = ('_position', '_rotation', '_origin_id', '_is_accurate')
 
-    def __init__(self, x, y, z, q0=None, q1=None, q2=None, q3=None, angle_z=None, origin_id=0):
+    def __init__(self, x, y, z, q0=None, q1=None, q2=None, q3=None,
+                 angle_z=None, origin_id=-1, is_accurate=True):
         self._position = Position(x,y,z)
         self._rotation = Rotation(q0,q1,q2,q3,angle_z)
         self._origin_id = origin_id
+        self._is_accurate = is_accurate
 
     @classmethod
     def _create_from_clad(cls, pose):
         return cls(pose.x, pose.y, pose.z,
                    q0=pose.q0, q1=pose.q1, q2=pose.q2, q3=pose.q3,
                    origin_id=pose.originID)
+
+    @classmethod
+    def _create_default(cls):
+        return cls(0.0, 0.0, 0.0,
+                   q0=1.0, q1=0.0, q2=0.0, q3=0.0,
+                   origin_id=-1)
 
     def __repr__(self):
         return "<%s %s %s origin_id=%d>" % (self.__class__.__name__, self.position, self.rotation, self.origin_id)
@@ -357,11 +365,13 @@ class Pose:
         new_x,new_y,new_z = new_pose.position.x_y_z
         new_angle_z = new_pose.rotation.angle_z
 
-        res_x = x + math.cos(angle_z.radians)*new_x - math.sin(angle_z.radians)*new_y
-        res_y = y + math.sin(angle_z.radians)*new_x + math.cos(angle_z.radians)*new_y
+        cos_angle = math.cos(angle_z.radians)
+        sin_angle = math.sin(angle_z.radians)
+        res_x = x + (cos_angle * new_x) - (sin_angle * new_y)
+        res_y = y + (sin_angle * new_x) + (cos_angle * new_y)
         res_z = z + new_z
         res_angle = angle_z + new_angle_z
-        return Pose(res_x, res_y, res_z, angle_z=res_angle)
+        return Pose(res_x, res_y, res_z, angle_z=res_angle, origin_id=self._origin_id)
 
     def encode_pose(self):
         x, y, z = self.position.x_y_z
@@ -411,6 +421,16 @@ class Pose:
         if not isinstance(value, int):
             raise TypeError("The type of origin_id must be int")
         self._origin_id = value
+
+    @property
+    def is_accurate(self):
+        '''bool: Returns True if this pose is valid and accurate.
+
+        Poses are marked as inaccurate if we detect movement via accelerometer,
+        or if they were observed from far enough away that we're less certain
+        of the exact pose.
+        '''
+        return self.is_valid and self._is_accurate
 
 
 def pose_quaternion(x, y, z, q0, q1, q2, q3, origin_id=0):
@@ -535,6 +555,59 @@ def angle_z_to_quaternion(angle_z):
     # q3 = cos(x/2)*cos(y/2)*sin(z/2) - sin(x/2)*sin(y/2)*cos(z/2)
     q3 = math.sin(angle_z.radians/2)
     return q0,q1,q2,q3
+
+
+class Vector2:
+    '''Represents a 2D Vector (type/units aren't specified)
+
+    Args:
+        x (float): X component
+        y (float): Y component
+    '''
+
+    __slots__ = ('_x', '_y')
+
+    def __init__(self, x, y):
+        self._x = x
+        self._y = y
+
+    @property
+    def x(self):
+        '''float: The x component.'''
+        return self._x
+
+    @property
+    def y(self):
+        '''float: The y component.'''
+        return self._y
+
+    @property
+    def x_y(self):
+        '''tuple (float, float): The X, Y elements of the Vector2 (x,y)'''
+        return self._x, self._y
+
+    def __repr__(self):
+        return "<%s x: %.2f y: %.2f>" % (self.__class__.__name__, self.x, self.y)
+
+    def __add__(self, other):
+        if not isinstance(other, Vector2):
+            raise TypeError("Unsupported operand for + expected Vector2")
+        return Vector2(self.x + other.x, self.y + other.y)
+
+    def __sub__(self, other):
+        if not isinstance(other, Vector2):
+            raise TypeError("Unsupported operand for - expected Vector2")
+        return Vector2(self.x - other.x, self.y - other.y)
+
+    def __mul__(self, other):
+        if not isinstance(other, (int, float)):
+            raise TypeError("Unsupported operand for * expected number")
+        return Vector2(self.x * other, self.y * other)
+
+    def __truediv__(self, other):
+        if not isinstance(other, (int, float)):
+            raise TypeError("Unsupported operand for / expected number")
+        return Vector2(self.x / other, self.y / other)
 
 
 class Vector3:

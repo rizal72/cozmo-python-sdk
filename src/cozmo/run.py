@@ -1,4 +1,4 @@
-# Copyright (c) 2016 Anki, Inc.
+# Copyright (c) 2016-2017 Anki, Inc.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -32,7 +32,7 @@ normally be a need to modify them or write your own.
 '''
 
 # __all__ should order by constants, event classes, other classes, functions.
-__all__ = ['DeviceConnector', 'IOSConnector', 'AndroidConnector',
+__all__ = ['DeviceConnector', 'IOSConnector', 'AndroidConnector', 'TCPConnector',
            'connect',  'connect_with_tkviewer', 'connect_on_loop',
            'run_program', 'setup_basic_logging']
 
@@ -50,6 +50,7 @@ import shutil
 import subprocess
 import sys
 import types
+import warnings
 
 from . import logger, logger_protocol
 
@@ -86,14 +87,14 @@ class DeviceConnector:
         if enable_env_vars:
             self.parse_env_vars()
 
-    async def connect(self, loop, protocol_factory):
+    async def connect(self, loop, protocol_factory, conn_check):
         '''Connect attempts to open a connection transport to the Cozmo app on a device.
 
         On opening a transport it will create a protocol from the supplied
         factory and connect it to the transport, returning a (transport, protocol)
         tuple. See :meth:`asyncio.BaseEventLoop.create_connection`
         '''
-        raise NotImplemented()
+        raise NotImplementedError
 
     def parse_env_vars(self):
         try:
@@ -343,6 +344,7 @@ class FirstAvailableConnector(DeviceConnector):
     This is the default connector used by ``connect_`` functions.
     '''
     def __init__(self):
+        super().__init__(self, enable_env_vars=False)
         self.tcp = TCPConnector()
         self.ios = IOSConnector()
         self.android = AndroidConnector()
@@ -359,7 +361,7 @@ class FirstAvailableConnector(DeviceConnector):
             result = await self._do_connect(self.tcp, *conn_args)
             if not isinstance(result, BaseException):
                 return result
-            logger.warn('No TCP connection found running Cozmo: %s', result)
+            logger.warning('No TCP connection found running Cozmo: %s', result)
 
         android_result = await self._do_connect(self.android, *conn_args)
         if not isinstance(android_result, BaseException):
@@ -369,8 +371,8 @@ class FirstAvailableConnector(DeviceConnector):
         if not isinstance(ios_result, BaseException):
             return ios_result
 
-        logger.warn('No iOS device found running Cozmo: %s', ios_result)
-        logger.warn('No Android device found running Cozmo: %s', android_result)
+        logger.warning('No iOS device found running Cozmo: %s', ios_result)
+        logger.warning('No Android device found running Cozmo: %s', android_result)
 
         raise exceptions.NoDevicesFound('No devices connected running Cozmo in SDK mode')
 
@@ -489,6 +491,8 @@ def _connect_async(f, conn_factory=conn.CozmoConnection, connector=None):
     coz_conn = connect_on_loop(loop, conn_factory, connector)
     try:
         loop.run_until_complete(f(coz_conn))
+    except KeyboardInterrupt:
+        logger.info('Exit requested by user')
     finally:
         loop.run_until_complete(coz_conn.shutdown())
         loop.stop()
@@ -645,7 +649,8 @@ def connect_with_tkviewer(f, conn_factory=conn.CozmoConnection, connector=None, 
 
 
 def setup_basic_logging(general_log_level=None, protocol_log_level=None,
-        protocol_log_messages=clad_protocol.LOG_ALL, target=sys.stderr):
+        protocol_log_messages=clad_protocol.LOG_ALL, target=sys.stderr,
+        deprecated_filter="default"):
     '''Helper to perform basic setup of the Python logging machinery.
 
     The SDK defines two loggers:
@@ -669,7 +674,15 @@ def setup_basic_logging(general_log_level=None, protocol_log_level=None,
             the COMZO_PROTOCOL_LOG_MESSAGES if available which should be
             a comma separated list of message names (case sensitive).
         target (object): The stream to send the log data to; defaults to stderr
+        deprecated_filter (str): The filter for any DeprecationWarning messages.
+            This is defaulted to "default" which shows the warning once per
+            location. You can hide all deprecated warnings by passing in "ignore",
+            see https://docs.python.org/3/library/warnings.html#warning-filter
+            for more information.
     '''
+    if deprecated_filter is not None:
+        warnings.filterwarnings(deprecated_filter, category=DeprecationWarning)
+
     if general_log_level is None:
         general_log_level = os.environ.get('COZMO_LOG_LEVEL', logging.INFO)
     if protocol_log_level is None:
@@ -695,14 +708,16 @@ def setup_basic_logging(general_log_level=None, protocol_log_level=None,
 
 
 def run_program(f, use_viewer=False, conn_factory=conn.CozmoConnection,
-               connector=None, force_viewer_on_top=False):
+                connector=None, force_viewer_on_top=False,
+                deprecated_filter="default"):
     '''Connect to Cozmo and run the provided program/function f.
 
     Args:
 
         f (callable): The function to execute, accepts a connected
             :class:`cozmo.robot.Robot` as the parameter.
-        use_viewer (bool): Specifies whether the window should be forced on top of all others
+        use_viewer (bool): Specifies whether to display a view of Cozmo's camera
+            in a window.
         conn_factory (callable): Override the factory function to generate a
             :class:`cozmo.conn.CozmoConnection` (or subclass) instance.
         connector (:class:`DeviceConnector`): Optional instance of a DeviceConnector
@@ -711,8 +726,13 @@ def run_program(f, use_viewer=False, conn_factory=conn.CozmoConnection,
             has the Cozmo app running in SDK mode.
         force_viewer_on_top (bool): Specifies whether the window should be
             forced on top of all others (only relevant if use_viewer is True).
+        deprecated_filter (str): The filter for any DeprecationWarning messages.
+            This is defaulted to "default" which shows the warning once per
+            location. You can hide all deprecated warnings by passing in "ignore",
+            see https://docs.python.org/3/library/warnings.html#warning-filter
+            for more information.
     '''
-    setup_basic_logging()
+    setup_basic_logging(deprecated_filter=deprecated_filter)
 
     # Wrap f (a function that takes in an already created robot)
     # with a function that accepts a cozmo.conn.CozmoConnection
@@ -722,6 +742,8 @@ def run_program(f, use_viewer=False, conn_factory=conn.CozmoConnection,
             try:
                 robot = await sdk_conn.wait_for_robot()
                 await f(robot)
+            except exceptions.SDKShutdown:
+                pass
             except KeyboardInterrupt:
                 logger.info('Exit requested by user')
     else:
@@ -730,6 +752,8 @@ def run_program(f, use_viewer=False, conn_factory=conn.CozmoConnection,
             try:
                 robot = sdk_conn.wait_for_robot()
                 f(robot)
+            except exceptions.SDKShutdown:
+                pass
             except KeyboardInterrupt:
                 logger.info('Exit requested by user')
 
@@ -738,5 +762,7 @@ def run_program(f, use_viewer=False, conn_factory=conn.CozmoConnection,
             connect_with_tkviewer(wrapper, conn_factory=conn_factory, connector=connector, force_on_top=force_viewer_on_top)
         else:
             connect(wrapper, conn_factory=conn_factory, connector=connector)
+    except KeyboardInterrupt:
+        logger.info('Exit requested by user')
     except exceptions.ConnectionError as e:
         sys.exit("A connection error occurred: %s" % e)

@@ -43,9 +43,6 @@ class EvtAnimationCompleted(action.EvtActionCompleted):
 
 class Animation(action.Action):
     '''An Animation describes an actively-playing animation on a robot.'''
-
-    _action_type = _clad_to_engine_cozmo.RobotActionType.PLAY_ANIMATION
-
     def __init__(self, anim_name, loop_count, **kw):
         super().__init__(**kw)
 
@@ -62,6 +59,12 @@ class Animation(action.Action):
         return _clad_to_engine_iface.PlayAnimation(
             robotID=self.robot.robot_id, animationName=self.anim_name, numLoops=self.loop_count)
 
+    def _dispatch_completed_event(self, msg):
+        self._completed_event = EvtAnimationCompleted(
+                action=self, state=self._state,
+                animation_name=self.anim_name)
+        self.dispatch_event(self._completed_event)
+
 
 class AnimationTrigger(action.Action):
     '''An AnimationTrigger represents a playing animation trigger.
@@ -69,9 +72,6 @@ class AnimationTrigger(action.Action):
     Asking Cozmo to play an AnimationTrigger causes him to pick one of the
     animations represented by the group.
     '''
-
-    _action_type = _clad_to_engine_cozmo.RobotActionType.PLAY_ANIMATION
-
     def __init__(self, trigger, loop_count, **kw):
         super().__init__(**kw)
 
@@ -89,10 +89,10 @@ class AnimationTrigger(action.Action):
             robotID=self.robot.robot_id, trigger=self.trigger.id, numLoops=self.loop_count)
 
     def _dispatch_completed_event(self, msg):
-        self.dispatch_event(EvtAnimationCompleted,
+        self._completed_event = EvtAnimationCompleted(
                 action=self, state=self._state,
                 animation_name=self.trigger.name)
-
+        self.dispatch_event(self._completed_event)
 
 
 class AnimationNames(event.Dispatcher, set):

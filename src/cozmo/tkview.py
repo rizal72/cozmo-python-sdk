@@ -1,4 +1,4 @@
-# Copyright (c) 2016 Anki, Inc.
+# Copyright (c) 2016-2017 Anki, Inc.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -48,6 +48,8 @@ from . import world
 
 class TkThreadable:
     '''A mixin for adding threadsafe calls to tkinter methods.'''
+    #pylint: disable=no-member
+    # no-member errors are raised in pylint regarding members/methods called but not defined in our mixin.
     def __init__(self, *a, **kw):
         self._thread_queue = queue.Queue()
         self.after(50, self._thread_call_dispatch)
@@ -115,6 +117,8 @@ class TkImageViewer(tkinter.Frame, TkThreadable):
             self.handler.disable()
         self.call_threadsafe(self.quit)
 
+    # The base class configure doesn't take an event
+    #pylint: disable=arguments-differ
     def configure(self, event):
         # hack to interrupt feedback loop between image resizing
         # and frame resize detection; there has to be a better solution to this.
@@ -130,7 +134,6 @@ class TkImageViewer(tkinter.Frame, TkThreadable):
     def image_event(self, evt, *, image, **kw):
         if self._first_image or self.width is None:
             img = image.annotate_image(scale=self.scale)
-            self._first_image = False
         else:
             img = image.annotate_image(fit_size=(self.width, self.height))
         self._img_queue.append(img)
@@ -150,6 +153,7 @@ class TkImageViewer(tkinter.Frame, TkThreadable):
             # no new image
             return
 
+        self._first_image = False
         photoImage = ImageTk.PhotoImage(image)
 
         self.label.configure(image=photoImage)

@@ -1,4 +1,4 @@
-# Copyright (c) 2016 Anki, Inc.
+# Copyright (c) 2016-2017 Anki, Inc.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -117,7 +117,7 @@ class World(event.Dispatcher):
         self.custom_objects = {}
 
         #: :class:`CameraImage`: The latest image received, or None.
-        self.latest_image = None
+        self.latest_image = None  # type: CameraImage
 
         self.light_cubes = {}
 
@@ -182,7 +182,7 @@ class World(event.Dispatcher):
             custom_object = self.custom_object_factory(self.conn, self, obj.object_type,
                                                        obj.x_size_mm, obj.y_size_mm, obj.z_size_mm,
                                                        obj.marker_width_mm, obj.marker_height_mm,
-                                                       dispatch_parent=self)
+                                                       obj.is_unique, dispatch_parent=self)
             custom_object.object_id = msg.objectID
             self._objects[custom_object.object_id] = custom_object
             logger.debug('Allocated object_id=%s to CustomObject %s', msg.objectID, custom_object)
@@ -288,11 +288,46 @@ class World(event.Dispatcher):
         '''
         return self._visible_pet_count
 
+    def get_light_cube(self, cube_id):
+        """Returns the light cube with the given cube ID
+                
+        Args:
+            cube_id (int): The light cube ID - should be one of
+                :attr:`~cozmo.objects.LightCube1Id`,
+                :attr:`~cozmo.objects.LightCube2Id` and
+                :attr:`~cozmo.objects.LightCube3Id`. Note: the cube_id is not
+                the same thing as the object_id.
+        Returns:
+            :class:`cozmo.objects.LightCube`: The LightCube object with that cube_id
+        
+        Raises:
+            :class:`ValueError` if the cube_id is invalid.
+        """
+        if cube_id not in objects.LightCubeIDs:
+            raise ValueError("Invalid cube_id %s" % cube_id)
+        cube = self.light_cubes.get(cube_id)
+        # Only return the cube if it has an object_id
+        if cube.object_id is not None:
+            return cube
+        return None
+
+    @property
+    def connected_light_cubes(self):
+        '''generator: yields each LightCube that Cozmo is currently connected to.
+
+        Returns:
+            A generator yielding :class:`cozmo.objects.LightCube` instances
+        '''
+        for cube_id in objects.LightCubeIDs:
+            cube = self.light_cubes.get(cube_id)
+            if cube and cube.is_connected:
+                yield cube
+
     #### Private Event Handlers ####
 
     def _recv_msg_robot_observed_object(self, evt, *, msg):
         #The engine still sends observed messages for fixed custom objects, this is a bug
-        if evt.msg.objectType == _clad_to_game_cozmo.ObjectType.Custom_Fixed:
+        if evt.msg.objectType == _clad_to_game_cozmo.ObjectType.CustomFixedObstacle:
             return
         obj = self._objects.get(msg.objectID)
         if not obj:
@@ -332,20 +367,66 @@ class World(event.Dispatcher):
         if pet:
             pet.dispatch_event(evt)
 
-    def _recv_msg_object_tapped(self, evt, *, msg):
+    def _dispatch_object_event(self, evt, msg):
         obj = self._objects.get(msg.objectID)
         if not obj:
-            logger.warn('Tap event received for unknown object ID %s', msg.objectID)
+            logger.warning('%s event received for unknown object ID %s', type(msg).__name__, msg.objectID)
             return
         obj.dispatch_event(evt)
 
-    def _recv_msg_available_objects(self, evt, *, msg):
-        for available_object in msg.objects:
-            obj = self._objects.get(available_object.objectID)
+    def _recv_msg_object_tapped(self, evt, *, msg):
+        self._dispatch_object_event(evt, msg)
+
+    def _recv_msg_object_moved(self, evt, *, msg):
+        self._dispatch_object_event(evt, msg)
+
+    def _recv_msg_object_stopped_moving(self, evt, *, msg):
+        self._dispatch_object_event(evt, msg)
+
+    def _recv_msg_object_power_level(self, evt, *, msg):
+        self._dispatch_object_event(evt, msg)
+
+    def _recv_msg_object_connection_state(self, evt, *, msg):
+        self._dispatch_object_event(evt, msg)
+
+    def _recv_msg_connected_object_states(self, evt, *, msg):
+        # This is received on startup as a response to RequestConnectedObjects.
+        for object_state in msg.objects:
+            obj = self._objects.get(object_state.objectID)
             if not obj:
-                obj = self._allocate_object_from_msg(available_object)
+                obj = self._allocate_object_from_msg(object_state)
             if obj:
-                obj._handle_available_object(available_object)
+                obj._handle_connected_object_state(object_state)
+
+    def _recv_msg_located_object_states(self, evt, *, msg):
+        # This is received on startup as a response to RequestLocatedObjectStates.
+        # It's also automatically sent from Engine whenever poses are rejiggered.
+        updated_objects = set()
+        for object_state in msg.objects:
+            obj = self._objects.get(object_state.objectID)
+            if not obj:
+                obj = self._allocate_object_from_msg(object_state)
+            if obj:
+                obj._handle_located_object_state(object_state)
+            updated_objects.add(object_state.objectID)
+        # ensure that all objects not received have invalidated poses
+        for id, obj in self._objects.items():
+            if (id not in updated_objects) and obj.pose.is_valid:
+                obj.pose.invalidate()
+
+    def _recv_msg_robot_deleted_located_object(self, evt, *, msg):
+        obj = self._objects.get(msg.objectID)
+        if obj is None:
+            logger.warning("Ignoring deleted_located_object for unknown object ID %s", msg.objectID)
+        else:
+            logger.info("Invalidating pose for deleted located object %s" % obj)
+            obj.pose.invalidate()
+
+    def _recv_msg_robot_delocalized(self, evt, *, msg):
+        # Invalidate the pose for every object
+        logger.info("Robot delocalized - invalidating poses for all objects")
+        for obj in self._objects.values():
+            obj.pose.invalidate()
 
     #### Public Event Handlers ####
 
@@ -568,89 +649,271 @@ class World(event.Dispatcher):
                 robotID=self.robot.robot_id, enable=True)
         self.conn.send_msg(msg)
 
-    async def _delete_all_objects(self):
-        # XXX marked this as private as apparently problematic to call
-        # currently as it deletes light cubes too.
-        msg = _clad_to_engine_iface.DeleteAllObjects(robotID=self.robot.robot_id)
-        self.conn.send_msg(msg)
-        await self.wait_for(_clad._MsgRobotDeletedAllObjects)
-        # TODO: reset local object state
+    def _remove_custom_marker_object_instances(self):
+        for id, obj in list(self._objects.items()):
+            if isinstance(obj, objects.CustomObject):
+                logger.info("Removing CustomObject instance: id %s = obj '%s'", id, obj)
+                del self._objects[id]
+
+    def _remove_fixed_custom_object_instances(self):
+        for id, obj in list(self._objects.items()):
+            if isinstance(obj, objects.FixedCustomObject):
+                logger.info("Removing FixedCustomObject instance: id %s = obj '%s'", id, obj)
+                del self._objects[id]
 
     async def delete_all_custom_objects(self):
-        """Causes the robot to forget about all custom objects it currently knows about."""
-        msg = _clad_to_engine_iface.DeleteAllCustomObjects(robotID=self.robot.robot_id)
+        """Causes the robot to forget about all custom (fixed + marker) objects it currently knows about.
+        
+        Note: This includes all fixed custom objects, and all custom marker object instances, 
+        BUT this does NOT remove the custom marker object definitions, so Cozmo
+        will continue to add new objects if he sees the markers again. To remove
+        the definitions for those objects use: :meth:`undefine_all_custom_marker_objects`
+        """
+        msg = _clad_to_engine_iface.DeleteAllCustomObjects()
         self.conn.send_msg(msg)
-        # TODO: use a filter to wait only for a message for the active robot
+        # suppression for _MsgRobotDeletedAllCustomObjects "no-member" on pylint
+        #pylint: disable=no-member
         await self.wait_for(_clad._MsgRobotDeletedAllCustomObjects)
-        # TODO: reset local object stte
+        self._remove_custom_marker_object_instances()
+        self._remove_fixed_custom_object_instances()
 
-    async def _define_custom_object(self, object_type, x_size_mm, y_size_mm, z_size_mm,
-                                   marker_width_mm=25, marker_height_mm=25):
+    async def delete_custom_marker_objects(self):
+        """Causes the robot to forget about all custom marker objects it currently knows about.
+
+        Note: This removes custom marker object instances only, it does NOT remove
+        fixed custom objects, nor does it remove the custom marker object definitions, so Cozmo
+        will continue to add new objects if he sees the markers again. To remove
+        the definitions for those objects use: :meth:`undefine_all_custom_marker_objects`
+        """
+        msg = _clad_to_engine_iface.DeleteCustomMarkerObjects()
+        self.conn.send_msg(msg)
+        #pylint: disable=no-member
+        await self.wait_for(_clad._MsgRobotDeletedCustomMarkerObjects)
+        self._remove_custom_marker_object_instances()
+
+    async def delete_fixed_custom_objects(self):
+        """Causes the robot to forget about all fixed custom objects it currently knows about.
+
+        Note: This removes fixed custom objects only, it does NOT remove
+        the custom marker object instances or definitions.
+        """
+        msg = _clad_to_engine_iface.DeleteFixedCustomObjects()
+        self.conn.send_msg(msg)
+        #pylint: disable=no-member
+        await self.wait_for(_clad._MsgRobotDeletedFixedCustomObjects)
+        self._remove_fixed_custom_object_instances()
+
+    async def undefine_all_custom_marker_objects(self):
+        """Remove all custom marker object definitions, and any instances of them in the world."""
+        msg = _clad_to_engine_iface.UndefineAllCustomMarkerObjects()
+        self.conn.send_msg(msg)
+        #pylint: disable=no-member
+        await self.wait_for(_clad._MsgRobotDeletedCustomMarkerObjects)
+        self._remove_custom_marker_object_instances()
+        # Remove all custom object definitions / archetypes
+        self.custom_objects.clear()
+
+    async def _wait_for_defined_custom_object(self, custom_object_archetype):
+        try:
+            #pylint: disable=no-member
+            msg = await self.wait_for(_clad._MsgDefinedCustomObject, timeout=5)
+        except asyncio.TimeoutError as e:
+            logger.error("Failed (Timed Out) to define: %s", custom_object_archetype)
+            return None
+
+        msg = msg.msg  # get the internal message
+        if msg.success:
+            type_id = custom_object_archetype.object_type.id
+            self.custom_objects[type_id] = custom_object_archetype
+            logger.info("Defined: %s", custom_object_archetype)
+            return custom_object_archetype
+        else:
+            logger.error("Failed to define Custom Object %s", custom_object_archetype)
+            return None
+
+    async def define_custom_box(self, custom_object_type,
+                                marker_front, marker_back,
+                                marker_top, marker_bottom,
+                                marker_left, marker_right,
+                                depth_mm, width_mm, height_mm,
+                                marker_width_mm, marker_height_mm,
+                                is_unique=True):
         '''Defines a cuboid of custom size and binds it to a specific custom object type.
 
-        Warning: This function is currently experimental and has several known issues.
-        1) There seems to be an off by 10x issue related to how the vision reports the object's
-        size and position.
-        2) The ID returned for these objects is not consistent.
-        3) Poor performance and other issues have been seen in the App when using this.
-        We plan to expand and improve upon it in a future release before making
-        it fully public and documented.
+        The engine will now detect the markers associated with this object and send an
+        object_observed message when they are seen. The markers must be placed in the center
+        of their respective sides. All 6 markers must be unique.
+
+        Args:
+            custom_object_type (:class:`cozmo.objects.CustomObjectTypes`): the
+                object type you are binding this custom object to
+            marker_front (:class:`cozmo.objects.CustomObjectMarkers`): the marker
+                affixed to the front of the object
+            marker_back (:class:`cozmo.objects.CustomObjectMarkers`): the marker
+                affixed to the back of the object
+            marker_top (:class:`cozmo.objects.CustomObjectMarkers`): the marker
+                affixed to the top of the object
+            marker_bottom (:class:`cozmo.objects.CustomObjectMarkers`): the marker
+                affixed to the bottom of the object
+            marker_left (:class:`cozmo.objects.CustomObjectMarkers`): the marker
+                affixed to the left of the object
+            marker_right (:class:`cozmo.objects.CustomObjectMarkers`): the marker
+                affixed to the right of the object
+            depth_mm (float): depth of the object (in millimeters) (X axis)
+            width_mm (float): width of the object (in millimeters) (Y axis)
+            height_mm (float): height of the object (in millimeters) (Z axis)
+                (the height of the object)
+            marker_width_mm (float): width of the printed marker (in millimeters).
+            maker_height_mm (float): height of the printed marker (in millimeters).
+            is_unique (bool): If True, the engine will assume there is only 1 of this object
+                (and therefore only 1 of each of any of these markers) in the world.
+
+        Returns:
+            A :class:`cozmo.object.CustomObject` instance with the specified dimensions.
+                This is None if the definition failed internally.
+                Note: No instances of this object are added to the world until they have been seen.
+
+        Raises:
+            TypeError if the custom_object_type is of the wrong type.
+            ValueError if the 6 markers aren't unique.
+        '''
+        if not isinstance(custom_object_type, objects._CustomObjectType):
+            raise TypeError("Unsupported object_type, requires CustomObjectType")
+
+        # verify all 6 markers are unique
+        markers = set([marker_front, marker_back, marker_top, marker_bottom, marker_left, marker_right])
+        if len(markers) != 6:
+            raise ValueError("all markers must be unique for a custom box")
+
+        custom_object_archetype = self.custom_object_factory(self.conn, self, custom_object_type,
+                                                             depth_mm, width_mm, height_mm,
+                                                             marker_width_mm, marker_height_mm,
+                                                             is_unique, dispatch_parent=self)
+
+        msg = _clad_to_engine_iface.DefineCustomBox(customType=custom_object_type.id,
+                                                    markerFront=marker_front.id,
+                                                    markerBack=marker_back.id,
+                                                    markerTop=marker_top.id,
+                                                    markerBottom=marker_bottom.id,
+                                                    markerLeft=marker_left.id,
+                                                    markerRight=marker_right.id,
+                                                    xSize_mm=depth_mm,
+                                                    ySize_mm=width_mm,
+                                                    zSize_mm=height_mm,
+                                                    markerWidth_mm=marker_width_mm,
+                                                    markerHeight_mm=marker_height_mm,
+                                                    isUnique=is_unique)
+
+        self.conn.send_msg(msg)
+
+        return await self._wait_for_defined_custom_object(custom_object_archetype)
+
+    async def define_custom_cube(self, custom_object_type,
+                                 marker,
+                                 size_mm,
+                                 marker_width_mm, marker_height_mm,
+                                 is_unique=True):
+        """Defines a cube of custom size and binds it to a specific custom object type.
 
         The engine will now detect the markers associated with this object and send an
         object_observed message when they are seen. The markers must be placed in the center
         of their respective sides.
 
         Args:
-            object_type (:class:`cozmo.objects.CustomObjectTypes`): the object
-                type you are binding this custom object to
-            x_size_mm (float): size of the object (in millimeters) in the x axis.
-            y_size_mm (float): size of the object (in millimeters) in the y axis.
-            z_size_mm (float): size of the object (in millimeters) in the z axis.
+            custom_object_type (:class:`cozmo.objects.CustomObjectTypes`): the
+                object type you are binding this custom object to.
+            marker:(:class:`cozmo.objects.CustomObjectMarkers`): the marker
+                affixed to every side of the cube.
+            size_mm: size of each side of the cube (in millimeters).
             marker_width_mm (float): width of the printed marker (in millimeters).
             maker_height_mm (float): height of the printed marker (in millimeters).
+            is_unique (bool): If True, the engine will assume there is only 1 of this object
+                (and therefore only 1 of each of any of these markers) in the world.
 
         Returns:
             A :class:`cozmo.object.CustomObject` instance with the specified dimensions.
-                This is not included in the world until it has been seen.
+                This is None if the definition failed internally.
+                Note: No instances of this object are added to the world until they have been seen.
 
-        Star Image:
+        Raises:
+            TypeError if the custom_object_type is of the wrong type.
+        """
 
-        .. image:: ../images/star5.png
-
-        Arrow Image:
-
-        .. image:: ../images/arrow.png
-
-        The markers must be placed in the same order as listed below:
-
-        Custom_STAR5_Box:
-            * Front - Star5
-            * Back - Arrow
-
-        Custom_STAR5_Cube:
-            * All 6 faces - Star5
-
-        Custom_ARROW_Box:
-            * Front - Arrow
-            * Back - Star5
-
-        Custom_ARROW_Cube:
-            * All 6 faces - Arrow
-        '''
-        # TODO make diagram for above docs!
-        if not isinstance(object_type, objects._CustomObjectType):
+        if not isinstance(custom_object_type, objects._CustomObjectType):
             raise TypeError("Unsupported object_type, requires CustomObjectType")
-        custom_object_base = self.custom_object_factory(object_type,
-                                                        x_size_mm, y_size_mm, z_size_mm,
-                                                        marker_width_mm, marker_height_mm,
-                                                        self.conn, self, dispatch_parent=self)
-        self.custom_objects[object_type.id] = custom_object_base
-        msg = _clad_to_engine_iface.DefineCustomObject(objectType=object_type.id,
-                                                       xSize_mm=x_size_mm, ySize_mm=y_size_mm, zSize_mm=z_size_mm,
-                                                       markerWidth_mm=marker_width_mm, markerHeight_mm=marker_height_mm)
+
+        custom_object_archetype = self.custom_object_factory(self.conn, self, custom_object_type,
+                                                             size_mm, size_mm, size_mm,
+                                                             marker_width_mm, marker_height_mm,
+                                                             is_unique, dispatch_parent=self)
+
+        msg = _clad_to_engine_iface.DefineCustomCube(customType=custom_object_type.id,
+                                                     marker=marker.id,
+                                                     size_mm=size_mm,
+                                                     markerWidth_mm=marker_width_mm,
+                                                     markerHeight_mm=marker_height_mm,
+                                                     isUnique=is_unique)
+
         self.conn.send_msg(msg)
-        await self.wait_for(_clad._MsgDefinedCustomObject)
-        return custom_object_base
+
+        return await self._wait_for_defined_custom_object(custom_object_archetype)
+
+    async def define_custom_wall(self, custom_object_type,
+                                 marker,
+                                 width_mm, height_mm,
+                                 marker_width_mm, marker_height_mm,
+                                 is_unique=True):
+        """Defines a wall of custom width and height, with a fixed depth of 10mm, and binds it to a specific custom object type.
+
+        The engine will now detect the markers associated with this object and send an
+        object_observed message when they are seen. The markers must be placed in the center
+        of their respective sides.
+
+        Args:
+            custom_object_type (:class:`cozmo.objects.CustomObjectTypes`): the
+                object type you are binding this custom object to.
+            marker:(:class:`cozmo.objects.CustomObjectMarkers`): the marker
+                affixed to the front and back of the wall
+            width_mm (float): width of the object (in millimeters). (Y axis).
+            height_mm (float): height of the object (in millimeters). (Z axis).
+            width_mm: width of the wall (along Y axis) (in millimeters).
+            height_mm: height of the wall (along Z axis) (in millimeters).
+            marker_width_mm (float): width of the printed marker (in millimeters).
+            maker_height_mm (float): height of the printed marker (in millimeters).
+            is_unique (bool): If True, the engine will assume there is only 1 of this object
+                (and therefore only 1 of each of any of these markers) in the world.
+
+        Returns:
+            A :class:`cozmo.object.CustomObject` instance with the specified dimensions.
+                This is None if the definition failed internally.
+                Note: No instances of this object are added to the world until they have been seen.
+
+        Raises:
+            TypeError if the custom_object_type is of the wrong type.
+        """
+
+        if not isinstance(custom_object_type, objects._CustomObjectType):
+            raise TypeError("Unsupported object_type, requires CustomObjectType")
+
+        # TODO: share this hardcoded constant from engine
+        WALL_THICKNESS_MM = 10.0
+
+        custom_object_archetype = self.custom_object_factory(self.conn, self, custom_object_type,
+                                                             WALL_THICKNESS_MM, width_mm, height_mm,
+                                                             marker_width_mm, marker_height_mm,
+                                                             is_unique, dispatch_parent=self)
+
+        msg = _clad_to_engine_iface.DefineCustomWall(customType=custom_object_type.id,
+                                                     marker=marker.id,
+                                                     width_mm=width_mm,
+                                                     height_mm=height_mm,
+                                                     markerWidth_mm=marker_width_mm,
+                                                     markerHeight_mm=marker_height_mm,
+                                                     isUnique=is_unique)
+
+        self.conn.send_msg(msg)
+
+        return await self._wait_for_defined_custom_object(custom_object_archetype)
 
     async def create_custom_fixed_object(self, pose, x_size_mm, y_size_mm, z_size_mm,
                                          relative_to_robot=False, use_robot_origin=True):
@@ -666,7 +929,7 @@ class World(event.Dispatcher):
                                       the origin_id of Cozmo.
 
         Returns:
-            A :class:`cozmo.object.FixedCustomObject` instance with the specified dimensions and pose.
+            A :class:`cozmo.objects.FixedCustomObject` instance with the specified dimensions and pose.
         '''
         # Override the origin of the pose to be the same as the robot's. This will make sure they are in
         # the same space in the engine every time.
@@ -678,6 +941,7 @@ class World(event.Dispatcher):
         msg = _clad_to_engine_iface.CreateFixedCustomObject(pose=pose.encode_pose(),
                                                             xSize_mm=x_size_mm, ySize_mm=y_size_mm, zSize_mm=z_size_mm)
         self.conn.send_msg(msg)
+        #pylint: disable=no-member
         response = await self.wait_for(_clad._MsgCreatedFixedCustomObject)
         fixed_custom_object = objects.FixedCustomObject(pose, x_size_mm, y_size_mm, z_size_mm, response.msg.objectID)
         self._objects[fixed_custom_object.object_id] = fixed_custom_object
@@ -696,6 +960,81 @@ class World(event.Dispatcher):
         msg = _clad_to_engine_iface.EnableBlockTapFilter(enable=enable)
         self.conn.send_msg(msg)
 
+    def disconnect_from_cubes(self):
+        """Disconnect from all cubes (to save battery life etc.).
+        
+        Call :meth:`connect_to_cubes` to re-connect to the cubes later.        
+        """
+        logger.info("Disconnecting from cubes.")
+        for cube in self.connected_light_cubes:
+            logger.info("Disconnecting from %s" % cube)
+
+        msg = _clad_to_engine_iface.BlockPoolResetMessage(enable=False,
+                                                          maintainPersistentPool=True)
+        self.conn.send_msg(msg)
+
+    async def connect_to_cubes(self):
+        """Connect to all cubes.
+        
+        Request that Cozmo connects to all cubes - this is required if you
+        previously called :meth:`disconnect_from_cubes` or
+        :meth:`auto_disconnect_from_cubes_at_end` with enable=False. Connecting
+        to a cube can take up to about 5 seconds, and this method will wait until
+        either all 3 cubes are connected, or it has timed out waiting for this.
+                
+        Returns:
+            bool: True if all 3 cubes are now connected.
+        """
+        connected_cubes = list(self.connected_light_cubes)
+        num_connected_cubes = len(connected_cubes)
+        num_unconnected_cubes = 3 - num_connected_cubes
+        if num_unconnected_cubes < 1:
+            logger.info("connect_to_cubes skipped - already connected to %s cubes", num_connected_cubes)
+            return True
+        logger.info("Connecting to cubes (already connected to %s, waiting for %s)", num_connected_cubes, num_unconnected_cubes)
+        for cube in connected_cubes:
+            logger.info("Already connected to %s" % cube)
+
+        msg = _clad_to_engine_iface.BlockPoolResetMessage(enable=True,
+                                                          maintainPersistentPool=True)
+        self.conn.send_msg(msg)
+
+        success = True
+
+        try:
+            for _ in range(num_unconnected_cubes):
+                #pylint: disable=no-member
+                msg = await self.wait_for(_clad._MsgObjectConnectionState, timeout=10)
+        except asyncio.TimeoutError as e:
+            logger.warning("Failed to connect to all cubes in time!")
+            success = False
+
+        if success:
+            logger.info("Connected to all cubes!")
+
+        self.conn._request_connected_objects()
+
+        try:
+            #pylint: disable=no-member
+            msg = await self.wait_for(_clad._MsgConnectedObjectStates, timeout=5)
+        except asyncio.TimeoutError as e:
+            logger.warning("Failed to receive connected cube states.")
+            success = False
+
+        return success
+
+    def auto_disconnect_from_cubes_at_end(self, enable=True):
+        """Tell the SDK to auto disconnect from cubes at the end of every SDK program.
+
+        This can be used to save cube battery life if you spend a lot of time in
+        SDK mode but aren't running programs as much (as you're busy writing
+        them). Call :meth:`connect_to_cubes` to re-connect to the cubes later. 
+
+        Args:
+            enable (bool): True if cubes should disconnect after every SDK program exits. 
+        """
+        msg = _clad_to_engine_iface.SetShouldAutoDisconnectFromCubesAtEnd(doAutoDisconnect=enable)
+        self.conn.send_msg(msg)
 
 class CameraImage:
     '''A single image from Cozmo's camera.
